@@ -19,32 +19,38 @@ using SARSOP
 using StatsBase
 using Test
 
+########################################
+# Type definitions
+########################################
 mutable struct Pose3D
     x::Float64
     y::Float64
     θ::Float64
 end
+function Base.:(+)(a::Pose3D, b::Pose3D)
+    Pose3D(a.x + b.x, a.y + b.y, a.θ + b.θ)
+end
 Pose3D() = Pose3D(0., 0., 0.)
-
+function Base.hash(p::Pose3D, h::UInt64=zero(UInt64))
+    return hash(v.posG.x,hash(v.posG.y,hash(v.posG.θ, h)))
+end
 mutable struct Environment
     speed_limit::Float64
 end
 Environment() = Environment(20.)
-
 struct VehicleState
     posG::Pose3D
     v::Float64
 end
+function Base.:(+)(a::VehicleState, b::VehicleState)
+    VehicleState(a.posG + b.posG, a.v + b.v)
+end
 function Base.hash(v::VehicleState, h::UInt64=zero(UInt64))
-    return hash(v.v,
-                hash(v.posG.x,
-                     hash(v.posG.y,
-                          hash(v.posG.θ, h))))
+    return hash(v.v, hash(v.posG))
 end
 VehicleState() = VehicleState(Pose3D(), 0.)
 VehicleState(x0::Float64, v0::Float64) = VehicleState(Pose3D(x0, 0., 0.), v0)
 VehicleState(v0::Float64) = VehicleState(Pose3D(), v0)
-
 mutable struct AccState
     crash::Bool
     ego::VehicleState
@@ -52,6 +58,9 @@ mutable struct AccState
 end
 AccState(crash0::Bool) = AccState(crash0, VehicleState(15.),
                                   VehicleState(10.))
+function Base.:(+)(a::AccState, b::AccState)
+    AccState(a.crash | b.crash, a.ego + b.ego, a.car + b.car)
+end
 function Base.copyto!(a::AccState, b::AccState)
     a.crash = b.crash
     a.ego = b.ego
@@ -64,12 +73,7 @@ end
 function Base.:(==)(a::AccState, b::AccState)
     return a.crash == b.crash && a.ego == b.ego && a.car == b.car
 end
-# init = AccState(false)
-# @show init
-# @show hash(init)
-
 const AccObs = AccState
-
 mutable struct AccAction
     acc::Float64
 end
@@ -83,8 +87,10 @@ function Base.:(==)(a::AccAction, b::AccAction)
     return a.acc = b.acc
 end
 
-
-mutable struct AccPOMDP <: POMDP{AccState, AccAction, AccObs}
+########################################
+# Model
+########################################
+mutable struct AccPOMDP <: POMDP{AccState,AccAction,AccObs}
     max_acc::Float64
     max_dec::Float64
     pos_res::Float64
@@ -105,24 +111,22 @@ mutable struct AccPOMDP <: POMDP{AccState, AccAction, AccObs}
     size_v::Int64
     grid::AbstractGrid
 end
-
-# use NamedTuple
-function CreateAccPOMDP(; max_acc::Float64 = 2.,
-    max_dec::Float64 = 2.,
-    pos_res::Float64 = 1.,
-    vel_res::Float64 = 2.,
-    pose_start::Pose3D = Pose3D(0., 0, 0.),
-    pose_end::Pose3D = Pose3D(200., 0., 0.),
-    road_end::Pose3D = Pose3D(300., 0., 0.),
-    ΔT::Float64 = 0.5,
-    a_noise::Float64 = 0.5,
-    pos_obs_noise::Float64 = 0.5,
-    vel_obs_noise::Float64 = 0.5,
-    collision_cost::Float64 = -1.,
-    action_cost::Float64 = 0.0,
-    goal_reward::Float64 = 1.,
-    γ::Float64 = 0.95,
-    speed_limit::Float64 = 20.)
+function CreateAccPOMDP(; max_acc::Float64=2.,
+    max_dec::Float64=2.,
+    pos_res::Float64=1.,
+    vel_res::Float64=2.,
+    pose_start::Pose3D=Pose3D(0., 0, 0.),
+    pose_end::Pose3D=Pose3D(200., 0., 0.),
+    road_end::Pose3D=Pose3D(300., 0., 0.),
+    ΔT::Float64=0.5,
+    a_noise::Float64=0.5,
+    pos_obs_noise::Float64=0.5,
+    vel_obs_noise::Float64=0.5,
+    collision_cost::Float64=-1.,
+    action_cost::Float64=0.0,
+    goal_reward::Float64=1.,
+    γ::Float64=0.95,
+    speed_limit::Float64=20.)
     size_x = Int(floor((pose_end.x - pose_start.x) / pos_res) + 1)
     size_v = Int(floor(speed_limit / vel_res) + 1)
     rect = RectangleGrid(LinRange(pose_start.x, pose_end.x, size_x),
@@ -135,6 +139,9 @@ function CreateAccPOMDP(; max_acc::Float64 = 2.,
                     rect)
 end
 
+########################################
+# Reward
+########################################
 function POMDPs.reward(pomdp::AccPOMDP, ::AccState, a::AccAction, sp::AccState)
     r = 0.
     if sp.crash
@@ -149,50 +156,31 @@ function POMDPs.reward(pomdp::AccPOMDP, ::AccState, a::AccAction, sp::AccState)
     end
     return r
 end
-
 function POMDPs.reward(pomdp::AccPOMDP, s::AccState, a::AccAction)
     return reward(pomdp, s, a, s)
 end
 
+########################################
+# Miscellaneous
+########################################
 function POMDPs.isterminal(pomdp::AccPOMDP, s::AccState)
     return s.crash || s.ego.posG.x >= pomdp.pose_end.x
 end
-
-mutable struct AccDistribution
-    p::Vector{Float64}
-    ss::Vector{AccState}
-end
-
-# AccDistribution() = AccDistribution(Float64[], AccState[])
-
-function pdf(d<:AccDistribution, s<:AccState)
-    for (i, sp) in enumerate(d.ss)
-        if sp == s
-            return d.p[i]
-        end
-    end
-    return 0.
-end
-
-function POMDPs.rand(rng::AbstractRNG, d::AccDistribution)
-    ns = sample(d.ss, Weights(d.p))
-    return ns
-end
-
-function most_likely_sate(d::AccDistribution)
-    ind = argmax(d.p)
-    return d.ss[ind]
-end
-
 function POMDPs.discount(pomdp::AccPOMDP)
     return pomdp.γ
 end
-
 function is_crash(ego::VehicleState, car::VehicleState)
     # Will move vehicle lenght, width into parameters
     return ego.posG.x + 5.0 >= car.posG.x
 end
+function Base.show(io::IO, s::AccState)
+    print(io, "AccState: ego(", s.ego.posG.x, ", ", s.ego.v, "), car(",
+          s.car.posG.x, ", ", s.car.v, ")")
+end
 
+########################################
+# States
+########################################
 function POMDPs.states(pomdp::AccPOMDP)
     env = pomdp.env
     V = LinRange(0, env.speed_limit, pomdp.size_v)
@@ -211,11 +199,9 @@ function POMDPs.states(pomdp::AccPOMDP)
     end
     return state_space
 end
-
-function n_states(pomdp::AccPOMDP)
-    return pomdp.size_x^2 + pomdp.size_v^2
-end
-
+# function n_states(pomdp::AccPOMDP)
+#     return pomdp.size_x^2 + pomdp.size_v^2
+# end
 function POMDPs.stateindex(pomdp::AccPOMDP, s::AccState)
     x_ego = s.ego.posG.x
     v_ego = s.ego.v
@@ -229,11 +215,13 @@ function POMDPs.stateindex(pomdp::AccPOMDP, s::AccState)
     return ind
 end
 
+########################################
+# Actions
+########################################
 POMDPs.actions(::AccPOMDP) = [AccAction(-4.0), AccAction(-3.0),
                               AccAction(-2.0), AccAction(-1.0),
                               AccAction(0.), AccAction(1.0),
                               AccAction(2.0)]
-
 function POMDPs.actionindex(pomdp::AccPOMDP, a::AccAction)
     if a.acc == -4.
         return 1
@@ -254,25 +242,60 @@ function POMDPs.actionindex(pomdp::AccPOMDP, a::AccAction)
     end
 end
 
+########################################
+# Observations
+########################################
 function POMDPs.observations(pomdp::AccPOMDP)
     return states(pomdp)
 end
-
-function POMDPs.obsindex(pomdp::AccPOMDP)
-    return stateindex(pomdp)
+function POMDPs.obsindex(pomdp::AccPOMDP, s::AccState)
+    return stateindex(pomdp, s)
 end
 
-# This function is deprecated!
-# function POMDPs.n_observations(pomdp::AccPOMDP)
-#     return n_states(pomdp)
-# end
-
-function Base.show(io::IO, s::AccState)
-    print(io, "AccState: ego(", s.ego.posG.x, ", ", s.ego.v, "), car(",
-          s.car.posG.x, ", ", s.car.v, ")")
+########################################
+# Initialstate
+########################################
+function POMDPs.initialstate(pomdp::AccPOMDP)
+    env = pomdp.env
+    V = LinRange(0, env.speed_limit, pomdp.size_v)
+    X = LinRange(pomdp.pose_start.x, pomdp.pose_end.x, pomdp.size_x)
+    states = AccState[]
+    ego = VehicleState(pomdp.pose_start, 0.)
+    for x in X
+        for v in V
+            car = VehicleState(x, v)
+            push!(states, AccState(is_crash(ego, car), ego, car))
+        end
+    end
+    probs = ones(length(states))
+    # normalize!(probs, 1)
+    return SparseCat(probs, states)
 end
 
-
+########################################
+# Transition
+########################################
+function POMDPs.transition(pomdp::AccPOMDP, s::AccState, a::AccAction)
+    dt = pomdp.ΔT
+    ego_states, ego_probs = ego_transition(pomdp, s.ego, a, dt)
+    car_states, car_probs = car_transition(pomdp, s.car, dt)
+    
+    n_next_states = length(ego_states) * length(car_states)
+    
+    next_states = Vector{AccState}(undef, n_next_states)
+    next_probs = zeros(n_next_states)
+    ind = 1
+    for (i, ego) in enumerate(ego_states)
+        for (j, car) in enumerate(car_states)
+            crash = is_crash(ego, car)
+            next_states[ind] = AccState(crash, ego, car)
+            next_probs[ind] = car_probs[j] * ego_probs[i]
+            ind += 1
+        end
+    end
+    normalize!(next_probs, 1)
+    SparseCat(next_states, next_probs)
+end
 function ego_transition(pomdp::AccPOMDP, ego::VehicleState, a::AccAction,
     dt::Float64)
     x = ego.posG.x + ego.v * dt + 0.5 * a.acc * dt^2
@@ -295,7 +318,6 @@ function ego_transition(pomdp::AccPOMDP, ego::VehicleState, a::AccAction,
     # normalize!(probs, 1)
     return states, probs
 end
-
 function car_transition(pomdp::AccPOMDP, car::VehicleState,
     dt::Float64)
     x = car.posG.x + car.v * dt
@@ -315,7 +337,7 @@ function car_transition(pomdp::AccPOMDP, car::VehicleState,
                 push!(states, car_state)
                 push!(probs, weight[i])
             else
-                state_ind = findall(x->x==car_state, states)
+                state_ind = findall(x -> x == car_state, states)
                 probs[state_ind] += weight[i]
             end
         end
@@ -327,44 +349,26 @@ function car_transition(pomdp::AccPOMDP, car::VehicleState,
     return states, probs
 end
 
-function POMDPs.transition(pomdp::AccPOMDP, s::AccState, a::AccAction,
-    dt::Float64 = pomdp.ΔT)
-    ego_states, ego_probs = ego_transition(pomdp, s.ego, a, dt)
-    car_states, car_probs = car_transition(pomdp, s.car, dt)
-
-    n_next_states = length(ego_states) * length(car_states)
-
-    next_states = Vector{AccState}(undef, n_next_states)
-    next_probs = zeros(n_next_states)
-    ind = 1
-    for (i, ego) in enumerate(ego_states)
-        for (j, car) in enumerate(car_states)
-            crash = is_crash(ego, car)
-            next_states[ind] = AccState(crash, ego, car)
-            next_probs[ind] = car_probs[j] * ego_probs[i]
-            ind += 1
-        end
-    end
-    normalize!(next_probs, 1)
-    SparseCat(next_states, next_probs)
-    return AccDistribution(next_probs, next_states)
-end
-
+########################################
+# Helper
+########################################
 function off_road(pomdp::AccPOMDP, car::VehicleState)
     return car.posG.x > pomdp.road_end.x
 end
-
 function in_bounds(pomdp::AccPOMDP, car::VehicleState)
     return car.posG.x >= 0. && car.posG.x <= pomdp.road_end.x &&
         car.v >= 0. && car.v <= pomdp.env.speed_limit
 end
 
+########################################
+# Observation
+########################################
 function POMDPs.observation(pomdp::AccPOMDP, sp::AccState)
     if off_road(pomdp, sp.car)
         o = AccObs(false, sp.ego, VehicleState(pomdp.road_end.x, sp.car.v))
-        return AccDistribution([1.], [o])
+        return SparseCat([1.], [o])
     elseif is_crash(sp.ego, sp.car)
-        return AccDistribution([1.], [sp])
+        return SparceCat([1.], [sp])
     end
     ego = sp.ego
     car = sp.car
@@ -378,7 +382,7 @@ function POMDPs.observation(pomdp::AccPOMDP, sp::AccState)
     neighbors[7] = VehicleState(car.posG.x - pomdp.pos_res, car.v + pomdp.vel_res)
     neighbors[8] = VehicleState(car.posG.x, car.v)
     neighbors[9] = VehicleState(car.posG.x + pomdp.pos_res, car.v + pomdp.vel_res)
-
+    
     obss = AccObs[]
     sizehint!(obss, 9)
     for neighbor in neighbors
@@ -388,7 +392,7 @@ function POMDPs.observation(pomdp::AccPOMDP, sp::AccState)
     end
     probs = ones(length(obss))
     normalize!(probs, 1)
-    return AccDistribution(probs, obss)
+    return SparceCat(probs, obss)
 end
 function POMDPs.observation(pomdp::AccPOMDP, ::AccAction, sp::AccState)
     observation(pomdp, sp)
@@ -398,84 +402,63 @@ function POMDPs.observation(pomdp::AccPOMDP, ::AccState, a::AccState,
     observation(pomdp, a, sp)
 end
 
+########################################
+# Initialobs
+########################################
+initialobs(pomdp::AccPOMDP, s::AccState) =
+    observation(pomdp, s)
 
-const AccBelief = AccDistribution
+########################################
+# Convert s
+########################################
 
+########################################
+# Belief and updater
+########################################
+const AccBelief = SparseCat
 mutable struct AccUpdater <: Updater
     pomdp::AccPOMDP
 end
-
-function initial_ego_state(pomdp::AccPOMDP)
-    return VehicleState(pomdp.pose_start, 20.)
-end
-
-function POMDPs.initialstate(pomdp::AccPOMDP)
-end
-
-function POMDPs.initialobs(pomdp::AccPOMDP, s::AccState)
-end
-
-function POMDPs.update(bu::AccUpdater, b::AccBelief,
+POMDPs.initialize_belief(::AccUpdater, d::Any) = d
+function POMDPs.update(up::AccUpdater, b::AccBelief,
     a::AccAction, o::AccObs)
-    bnew = AccBelief()
-    pomdp = bu.pomdp
+    bp = AccBelief()
+    pomdp = b.pomdp
     pomdp_states = ordered_states(pomdp)
 
     for (_, sp) in enumerate(pomdp_states)
         od = observation(pomdp, a, sp)
-        probo = pdf(od, o)
-        if probo == 0.0
+        prob_o = pdf(od, o)
+        if prob_o == 0.0
             continue
         end
         b_sum = 0.0
-        for (j, s) in enumerate(b.ss)
+        for (j, s) in enumerate(b.vals)
             td = transition(pomdp, s, a)
-            pp = pdf(td, sp)
-            @inbounds b_sum += pp * b.p[j]
+            prob_sp = pdf(td, sp)
+            @inbounds b_sum += prob_sp * b.probs[j]
         end
         if b_sum != 0.
-            push!(bnew.ss, sp)
-            push!(bnew.p, probo*b_sum)
+            push!(bp.vals, sp)
+            push!(bp.probs, prob_o * b_sum)
         end
     end
 
-    if sum(bnew.p) == 0.0
+    if sum(bp.probs) == 0.0
         println("Invalid update for: ", b, " ", a, " ", o)
         throw("UpdateError")
     else
-        normalize!(bnew.p, 1)
+        normalize!(bp.probs, 1)
     end
-    bnew
+    return bp
 end
-
-# Deprecated in POMDPs v0.9
-function POMDPs.initialstate_distribution(pomdp::AccPOMDP)
-    env = pomdp.env
-    V = LinRange(0, env.speed_limit, pomdp.size_v)
-    X = LinRange(pomdp.pose_start.x, pomdp.pose_end.x, pomdp.size_x)
-    states = AccState[]
-    ego = VehicleState(pomdp.pose_start, 0.)
-    for x in X
-        for v in V
-            car = VehicleState(x, v)
-            push!(states, AccState(is_crash(ego, car), ego, car))
-        end
-    end
-    probs = ones(length(states))
-    # normalize!(probs, 1)
-    return AccBelief(probs, states)
-end
-function POMDPs.initialobs(pomdp::AccPOMDP, s::AccState, rng::AbstractRNG)
-    rand(rng, initialobs(pomdp, s))
-end
-
 
 @testset  "Acc POMDP" begin
     rng = MersenneTwister(1)
 
     pomdp = CreateAccPOMDP()
 
-    if true
+    if false
         # Solve
         # solver = POMDPSolveSolver()
         # solver = QMDPSolver()
@@ -512,11 +495,11 @@ end
         # Simulation
         policy = RandomPolicy(pomdp, rng=rng)
         up = KMarkovUpdater(5)
-        # s0 = rand(rng, initialstate(pomdp))
-        s0 = AccState(false, VehicleState(0., 20.), VehicleState(20., 15.))
+        s0 = rand(rng, initialstate(pomdp))
+        # s0 = AccState(false, VehicleState(0., 20.), VehicleState(20., 15.))
         @show s0
-        # initial_observation = rand(rng, initialobs(pomdp, s0))
-        initial_obs_vec = fill(s0, 5)
+        initial_observation = rand(rng, initialobs(pomdp, s0))
+        initial_obs_vec = fill(initial_observation, 5)
         hr = HistoryRecorder(rng=rng, max_steps=100)
         @time hist = simulate(hr, pomdp, policy, up, initial_obs_vec, s0)
         state_history = state_hist(hist)
