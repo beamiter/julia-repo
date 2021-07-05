@@ -1,3 +1,5 @@
+using Base: Float64
+using POMDPModelTools:stateindex
 using AutoViz
 using BeliefUpdaters
 using Distributions
@@ -27,17 +29,25 @@ mutable struct Pose3D
     y::Float64
     θ::Float64
 end
+Pose3D() = Pose3D(0., 0., 0.)
+function Base.:(*)(p::Pose3D, w::Float64)
+    return Pose3D(p.x * w, p.y * w, p.θ * w)
+end
+function Base.:(==)(a::Pose3D, b::Pose3D)
+    return a.x == b.x && a.y == b.y && a.θ == b.θ
+end
 function Base.:(+)(a::Pose3D, b::Pose3D)
     Pose3D(a.x + b.x, a.y + b.y, a.θ + b.θ)
 end
-Pose3D() = Pose3D(0., 0., 0.)
 function Base.hash(p::Pose3D, h::UInt64=zero(UInt64))
-    return hash(v.posG.x,hash(v.posG.y,hash(v.posG.θ, h)))
+    return hash(v.posG.x, hash(v.posG.y, hash(v.posG.θ, h)))
 end
+
 mutable struct Environment
     speed_limit::Float64
 end
 Environment() = Environment(20.)
+
 struct VehicleState
     posG::Pose3D
     v::Float64
@@ -51,6 +61,10 @@ end
 VehicleState() = VehicleState(Pose3D(), 0.)
 VehicleState(x0::Float64, v0::Float64) = VehicleState(Pose3D(x0, 0., 0.), v0)
 VehicleState(v0::Float64) = VehicleState(Pose3D(), v0)
+function Base.:(*)(s::VehicleState, w::Float64)
+    return VehicleState(s.posG * w, s.v * w)
+end
+
 mutable struct AccState
     crash::Bool
     ego::VehicleState
@@ -58,6 +72,9 @@ mutable struct AccState
 end
 AccState(crash0::Bool) = AccState(crash0, VehicleState(15.),
                                   VehicleState(10.))
+function Base.:(*)(s::AccState, w::Float64)
+    return AccState(s.crash, s.ego * w, s.car * w)
+end
 function Base.:(+)(a::AccState, b::AccState)
     AccState(a.crash | b.crash, a.ego + b.ego, a.car + b.car)
 end
@@ -66,13 +83,22 @@ function Base.copyto!(a::AccState, b::AccState)
     a.ego = b.ego
     a.car = b.car
 end
+function Base.isless(a::AccState, b::AccState)
+    return false
+end
+function Base.isless(a::AccState, w::Float64)
+    return false
+end
 function Base.hash(s::AccState, h::UInt64=zero(UInt64))
     return hash(s.crash, hash(s.ego, hash(s.car, h)))
 end
-
+function Base.zero(::Type{AccState})
+    return AccState(false, VehicleState(0., 0., ), VehicleState(1000., 0.))
+end
 function Base.:(==)(a::AccState, b::AccState)
     return a.crash == b.crash && a.ego == b.ego && a.car == b.car
 end
+
 const AccObs = AccState
 mutable struct AccAction
     acc::Float64
@@ -111,11 +137,12 @@ mutable struct AccPOMDP <: POMDP{AccState,AccAction,AccObs}
     size_v::Int64
     grid::AbstractGrid
 end
+
 function CreateAccPOMDP(; max_acc::Float64=2.,
     max_dec::Float64=2.,
     pos_res::Float64=1.,
     vel_res::Float64=2.,
-    pose_start::Pose3D=Pose3D(0., 0, 0.),
+    pose_start::Pose3D=Pose3D(0., 0., 0.),
     pose_end::Pose3D=Pose3D(200., 0., 0.),
     road_end::Pose3D=Pose3D(300., 0., 0.),
     ΔT::Float64=0.5,
@@ -213,6 +240,18 @@ function POMDPs.stateindex(pomdp::AccPOMDP, s::AccState)
     v_car_ind = Int(ceil(v_car / pomdp.vel_res)) + 1
     ind = LinearIndices((pomdp.size_x, pomdp.size_v, pomdp.size_x, pomdp.size_v))[x_ego_ind, v_ego_ind, x_car_ind, v_car_ind]
     return ind
+end
+
+function POMDPs.convert_s(::Type{S}, v::AbstractArray, pomdp::AccPOMDP) where (S <: AccState)
+    id = first(v)
+    x_ego_ind, v_ego_ind, x_car_ind, v_car_ind = CartesianIndices((pomdp.size_x, pomdp.size_v, pomdp.size_x, pomdp.size_v))[id].I
+    x_ego = Float64(floor(x_ego_ind - 1))
+    v_ego = Float64(floor(v_ego_ind - 1))
+    x_car = Float64(floor(x_car_ind - 1))
+    v_car = Float64(floor(v_car_ind - 1))
+    ego = VehicleState(x_ego, v_ego)
+    car = VehicleState(x_car, v_car)
+    return AccState(is_crash(ego, car), ego, car)
 end
 
 ########################################
@@ -368,7 +407,7 @@ function POMDPs.observation(pomdp::AccPOMDP, sp::AccState)
         o = AccObs(false, sp.ego, VehicleState(pomdp.road_end.x, sp.car.v))
         return SparseCat([1.], [o])
     elseif is_crash(sp.ego, sp.car)
-        return SparceCat([1.], [sp])
+        return SparseCat([1.], [sp])
     end
     ego = sp.ego
     car = sp.car
@@ -411,6 +450,9 @@ initialobs(pomdp::AccPOMDP, s::AccState) =
 ########################################
 # Convert s
 ########################################
+function POMDPs.convert_s(::Type{A}, s::AccState, pomdp::AccPOMDP) where A <: AbstractArray
+    return convert(A, [stateindex(pomdp, s)])
+end
 
 ########################################
 # Belief and updater
@@ -458,12 +500,12 @@ end
 
     pomdp = CreateAccPOMDP()
 
-    if false
+    if true
         # Solve
-        # solver = POMDPSolveSolver()
+        solver = POMDPSolveSolver()
         # solver = QMDPSolver()
         # solver = FIBSolver()
-        solver = SARSOPSolver()
+        # solver = SARSOPSolver()
         policy0 = solve(solver, pomdp) # compute a pomdp policy
 
         # rand_policy = RandomPolicy(pomdp)
@@ -497,7 +539,7 @@ end
         up = KMarkovUpdater(5)
         s0 = rand(rng, initialstate(pomdp))
         # s0 = AccState(false, VehicleState(0., 20.), VehicleState(20., 15.))
-        @show s0
+        # @show s0
         initial_observation = rand(rng, initialobs(pomdp, s0))
         initial_obs_vec = fill(initial_observation, 5)
         hr = HistoryRecorder(rng=rng, max_steps=100)
@@ -508,14 +550,14 @@ end
         x_ego = [s.ego.posG.x for s in state_history]
         v_ego = [s.ego.v for s in state_history]
         dx = [s.car.posG.x - s.ego.posG.x for s in state_history]
-        @show x_car
-        @show v_car
-        @show x_ego
-        @show v_ego
-        @show dx
+        # @show x_car
+        # @show v_car
+        # @show x_ego
+        # @show v_ego
+        # @show dx
 
         # @show hist
-        @show n_steps(hist)
+        # @show n_steps(hist)
         @test n_steps(hist) > 1
     end
 
