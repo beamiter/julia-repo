@@ -1,4 +1,6 @@
-using Base: Float64
+using POMDPPolicies:push!
+using Reel:push!
+using Base:Float64
 using POMDPModelTools:stateindex
 using AutoViz
 using BeliefUpdaters
@@ -13,6 +15,7 @@ using POMDPSolve
 using POMDPModels # this defines TigerPOMDP
 using POMDPs
 using POMDPModelTools
+using Printf
 # using POMCPOW
 using QMDP
 using Reel
@@ -20,49 +23,45 @@ using Random
 using SARSOP
 using StatsBase
 using Test
+using Vec
 
 ########################################
 # Type definitions
 ########################################
-mutable struct Pose3D
-    x::Float64
-    y::Float64
-    θ::Float64
-end
-Pose3D() = Pose3D(0., 0., 0.)
-function Base.:(*)(p::Pose3D, w::Float64)
-    return Pose3D(p.x * w, p.y * w, p.θ * w)
-end
-function Base.:(==)(a::Pose3D, b::Pose3D)
-    return a.x == b.x && a.y == b.y && a.θ == b.θ
-end
-function Base.:(+)(a::Pose3D, b::Pose3D)
-    Pose3D(a.x + b.x, a.y + b.y, a.θ + b.θ)
-end
-function Base.hash(p::Pose3D, h::UInt64=zero(UInt64))
-    return hash(v.posG.x, hash(v.posG.y, hash(v.posG.θ, h)))
-end
 
 mutable struct Environment
     speed_limit::Float64
 end
 Environment() = Environment(20.)
 
+const Frenet = Nothing
+
 struct VehicleState
-    posG::Pose3D
+    pos_g::VecSE2{Float64}
+    pos_f::Frenet
     v::Float64
 end
-function Base.:(+)(a::VehicleState, b::VehicleState)
-    VehicleState(a.posG + b.posG, a.v + b.v)
+
+VehicleState() = VehicleState(VecSE2(), nothing, NaN)
+VehicleState(pos_g::VecSE2{Float64}, v::Float64) = VehicleState(pos_g, nothing, v)
+VehicleState(x::Float64, v::Float64) = VehicleState(VecSE2(x, 0.), nothing, v)
+VehicleState(v::Float64) = VehicleState(VecSE2(), nothing, v)
+
+posf(veh::VehicleState) = veh.pos_f
+vel(veh::VehicleState) = veh.v
+velg(veh::VehicleState) = (vx = veh.v * cos(veh.pos_g.θ), vy = veh.v * sin(veh.pos_g.θ))
+Base.show(io::IO, s::VehicleState) = print(io, "VehicleState(", s.pos_g, ", ", @sprintf("%.3f", s.v), ")")
+
+function Base.write(io::IO, s::VehicleState)
 end
-function Base.hash(v::VehicleState, h::UInt64=zero(UInt64))
-    return hash(v.v, hash(v.posG))
+
+function Base.read(io::IO, ::Type{VehicleState})
 end
-VehicleState() = VehicleState(Pose3D(), 0.)
-VehicleState(x0::Float64, v0::Float64) = VehicleState(Pose3D(x0, 0., 0.), v0)
-VehicleState(v0::Float64) = VehicleState(Pose3D(), v0)
-function Base.:(*)(s::VehicleState, w::Float64)
-    return VehicleState(s.posG * w, s.v * w)
+
+function Vec.lerp(a::VehicleState, b::VehicleState, t::Float64)
+    pos_g = lerp(a.pos_g, b.pos_g, t)
+    v = lerp(a.v, b.v, t)
+    VehicleState(pos_g, v)
 end
 
 mutable struct AccState
@@ -70,31 +69,20 @@ mutable struct AccState
     ego::VehicleState
     car::VehicleState
 end
+
 AccState(crash0::Bool) = AccState(crash0, VehicleState(15.),
                                   VehicleState(10.))
-function Base.:(*)(s::AccState, w::Float64)
-    return AccState(s.crash, s.ego * w, s.car * w)
-end
-function Base.:(+)(a::AccState, b::AccState)
-    AccState(a.crash | b.crash, a.ego + b.ego, a.car + b.car)
-end
+
 function Base.copyto!(a::AccState, b::AccState)
     a.crash = b.crash
     a.ego = b.ego
     a.car = b.car
 end
-function Base.isless(a::AccState, b::AccState)
-    return false
-end
-function Base.isless(a::AccState, w::Float64)
-    return false
-end
+
 function Base.hash(s::AccState, h::UInt64=zero(UInt64))
     return hash(s.crash, hash(s.ego, hash(s.car, h)))
 end
-function Base.zero(::Type{AccState})
-    return AccState(false, VehicleState(0., 0., ), VehicleState(1000., 0.))
-end
+
 function Base.:(==)(a::AccState, b::AccState)
     return a.crash == b.crash && a.ego == b.ego && a.car == b.car
 end
@@ -116,14 +104,16 @@ end
 ########################################
 # Model
 ########################################
+const Pos3D = VecSE2{Float64}
 mutable struct AccPOMDP <: POMDP{AccState,AccAction,AccObs}
+    p_birth::Float64
     max_acc::Float64
     max_dec::Float64
     pos_res::Float64
     vel_res::Float64
-    pose_start::Pose3D
-    pose_end::Pose3D
-    road_end::Pose3D
+    pos_start::Pos3D
+    pos_end::Pos3D
+    road_end::Pos3D
     ΔT::Float64
     a_noise::Float64
     pos_obs_noise::Float64
@@ -138,13 +128,15 @@ mutable struct AccPOMDP <: POMDP{AccState,AccAction,AccObs}
     grid::AbstractGrid
 end
 
-function CreateAccPOMDP(; max_acc::Float64=2.,
+function CreateAccPOMDP(; 
+    p_birth::Float64=0.3,
+    max_acc::Float64=2.,
     max_dec::Float64=2.,
     pos_res::Float64=1.,
     vel_res::Float64=2.,
-    pose_start::Pose3D=Pose3D(0., 0., 0.),
-    pose_end::Pose3D=Pose3D(200., 0., 0.),
-    road_end::Pose3D=Pose3D(300., 0., 0.),
+    pos_start::Pos3D=Pos3D(0., 0., 0.),
+    pos_end::Pos3D=Pos3D(200., 0., 0.),
+    road_end::Pos3D=Pos3D(220., 0., 0.),
     ΔT::Float64=0.5,
     a_noise::Float64=0.5,
     pos_obs_noise::Float64=0.5,
@@ -154,13 +146,13 @@ function CreateAccPOMDP(; max_acc::Float64=2.,
     goal_reward::Float64=1.,
     γ::Float64=0.95,
     speed_limit::Float64=20.)
-    size_x = Int(floor((pose_end.x - pose_start.x) / pos_res) + 1)
+    size_x = Int(floor(road_end.x / pos_res + 1))
     size_v = Int(floor(speed_limit / vel_res) + 1)
-    rect = RectangleGrid(LinRange(pose_start.x, pose_end.x, size_x),
+    rect = RectangleGrid(LinRange(0., road_end.x, size_x),
                          LinRange(0., speed_limit, size_v))
     # @show rect
-    return AccPOMDP(max_acc, max_dec, pos_res, vel_res, pose_start,
-                    pose_end, road_end, ΔT, a_noise, pos_obs_noise,
+    return AccPOMDP(p_birth, max_acc, max_dec, pos_res, vel_res, pos_start,
+                    pos_end, road_end, ΔT, a_noise, pos_obs_noise,
                     vel_obs_noise, collision_cost, action_cost,
                     goal_reward, γ, Environment(speed_limit), size_x, size_v,
                     rect)
@@ -174,7 +166,7 @@ function POMDPs.reward(pomdp::AccPOMDP, ::AccState, a::AccAction, sp::AccState)
     if sp.crash
         r += pomdp.collision_cost
     end
-    if sp.ego.posG.x >= pomdp.pose_end.x
+    if sp.ego.pos_g.x >= pomdp.pos_end.x
         r += pomdp.goal_reward
     elseif a.acc > 0.
         r += pomdp.action_cost
@@ -191,18 +183,45 @@ end
 # Miscellaneous
 ########################################
 function POMDPs.isterminal(pomdp::AccPOMDP, s::AccState)
-    return s.crash || s.ego.posG.x >= pomdp.pose_end.x
+    return s.crash || s.ego.pos_g.x >= pomdp.pos_end.x
 end
+
 function POMDPs.discount(pomdp::AccPOMDP)
     return pomdp.γ
 end
+
 function is_crash(ego::VehicleState, car::VehicleState)
     # Will move vehicle lenght, width into parameters
-    return ego.posG.x + 5.0 >= car.posG.x
+    return ego.pos_g.x + 5.0 >= car.pos_g.x
 end
+
 function Base.show(io::IO, s::AccState)
-    print(io, "AccState: ego(", s.ego.posG.x, ", ", s.ego.v, "), car(",
-          s.car.posG.x, ", ", s.car.v, ")")
+    print(io, "AccState: ego(", s.ego.pos_g.x, ", ", s.ego.v, "), car(",
+          s.car.pos_g.x, ", ", s.car.v, ")")
+end
+
+########################################
+# Distribution
+########################################
+mutable struct AccDistribution
+    p::Vector{Float64}
+    it::Vector{AccState}
+end
+
+AccDistribution() = AccDistribution(Float64[], AccState[])
+
+function POMDPs.pdf(d::AccDistribution, s::AccState)
+    for (i, sp) in enumerate(d.it)
+        if sp == s
+            return d.p[i]
+        end
+    end
+    return 0.
+end
+
+function POMDPs.rand(rng::AbstractRNG, d::AccDistribution)
+    ns = sample(d.it, Weights(d.p))
+    return ns
 end
 
 ########################################
@@ -211,7 +230,7 @@ end
 function POMDPs.states(pomdp::AccPOMDP)
     env = pomdp.env
     V = LinRange(0, env.speed_limit, pomdp.size_v)
-    X = LinRange(pomdp.pose_start.x, pomdp.pose_end.x, pomdp.size_x)
+    X = LinRange(pomdp.pos_start.x, pomdp.pos_end.x, pomdp.size_x)
     state_space = Vector{AccState}()
     for x0 in X
         for v0 in V
@@ -226,33 +245,20 @@ function POMDPs.states(pomdp::AccPOMDP)
     end
     return state_space
 end
-# function n_states(pomdp::AccPOMDP)
-#     return pomdp.size_x^2 + pomdp.size_v^2
-# end
+
 function POMDPs.stateindex(pomdp::AccPOMDP, s::AccState)
-    x_ego = s.ego.posG.x
+    x_ego = s.ego.pos_g.x
     v_ego = s.ego.v
-    x_car = s.car.posG.x
+    x_car = s.car.pos_g.x
     v_car = s.car.v
-    x_ego_ind = Int(ceil((x_ego - pomdp.pose_start.x) / pomdp.pos_res)) + 1
+    x_ego_ind = Int(ceil((x_ego - pomdp.pos_start.x) / pomdp.pos_res)) + 1
     v_ego_ind = Int(ceil(v_ego / pomdp.vel_res)) + 1
-    x_car_ind = Int(ceil((x_car - pomdp.pose_start.x) / pomdp.pos_res)) + 1
+    x_car_ind = Int(ceil((x_car - pomdp.pos_start.x) / pomdp.pos_res)) + 1
     v_car_ind = Int(ceil(v_car / pomdp.vel_res)) + 1
     ind = LinearIndices((pomdp.size_x, pomdp.size_v, pomdp.size_x, pomdp.size_v))[x_ego_ind, v_ego_ind, x_car_ind, v_car_ind]
     return ind
 end
 
-function POMDPs.convert_s(::Type{S}, v::AbstractArray, pomdp::AccPOMDP) where (S <: AccState)
-    id = first(v)
-    x_ego_ind, v_ego_ind, x_car_ind, v_car_ind = CartesianIndices((pomdp.size_x, pomdp.size_v, pomdp.size_x, pomdp.size_v))[id].I
-    x_ego = Float64(floor(x_ego_ind - 1))
-    v_ego = Float64(floor(v_ego_ind - 1))
-    x_car = Float64(floor(x_car_ind - 1))
-    v_car = Float64(floor(v_car_ind - 1))
-    ego = VehicleState(x_ego, v_ego)
-    car = VehicleState(x_car, v_car)
-    return AccState(is_crash(ego, car), ego, car)
-end
 
 ########################################
 # Actions
@@ -287,6 +293,7 @@ end
 function POMDPs.observations(pomdp::AccPOMDP)
     return states(pomdp)
 end
+
 function POMDPs.obsindex(pomdp::AccPOMDP, s::AccState)
     return stateindex(pomdp, s)
 end
@@ -297,9 +304,9 @@ end
 function POMDPs.initialstate(pomdp::AccPOMDP)
     env = pomdp.env
     V = LinRange(0, env.speed_limit, pomdp.size_v)
-    X = LinRange(pomdp.pose_start.x, pomdp.pose_end.x, pomdp.size_x)
+    X = LinRange(pomdp.pos_start.x, pomdp.pos_end.x, pomdp.size_x)
     states = AccState[]
-    ego = VehicleState(pomdp.pose_start, 0.)
+    ego = VehicleState(pomdp.pos_start, 0.)
     for x in X
         for v in V
             car = VehicleState(x, v)
@@ -308,7 +315,7 @@ function POMDPs.initialstate(pomdp::AccPOMDP)
     end
     probs = ones(length(states))
     # normalize!(probs, 1)
-    return SparseCat(states, probs)
+    return SparseCat(probs, states)
 end
 
 ########################################
@@ -333,13 +340,14 @@ function POMDPs.transition(pomdp::AccPOMDP, s::AccState, a::AccAction)
         end
     end
     normalize!(next_probs, 1)
-    SparseCat(next_states, next_probs)
+    return AccDistribution(next_probs, next_states)
 end
+
 function ego_transition(pomdp::AccPOMDP, ego::VehicleState, a::AccAction,
     dt::Float64)
-    x = ego.posG.x + ego.v * dt + 0.5 * a.acc * dt^2
-    if x <= ego.posG.x
-        x = ego.posG.x
+    x = ego.pos_g.x + ego.v * dt + 0.5 * a.acc * dt^2
+    if x <= ego.pos_g.x
+        x = ego.pos_g.x
     end
     v = ego.v + a.acc * dt
     if v <= 0.0
@@ -357,17 +365,36 @@ function ego_transition(pomdp::AccPOMDP, ego::VehicleState, a::AccAction,
     # normalize!(probs, 1)
     return states, probs
 end
+
 function car_transition(pomdp::AccPOMDP, car::VehicleState,
     dt::Float64)
-    x = car.posG.x + car.v * dt
+    x = car.pos_g.x + car.v * dt
     if x > pomdp.road_end.x
         return [VehicleState(pomdp.road_end.x, car.v)]
     end
     states = VehicleState[]
+    sizehint!(states, 8)
     probs = Float64[]
+    if off_the_road(pomdp, car)
+        p_birth = pomdp.p_birth
+        for v in LinRange(0, pomdp.env.speed_limit, pomdp.size_v)
+            push!(states, VehicleState(0, v))
+        end
+        probs = ones(length(states) + 1)
+        probs[1:end - 1] = p_birth / length(states)
+        # add the off the road state
+        push!(states, get_off_the_road(pomdp))
+        probs[end] = 1.0 - p_birth
+        normalize!(probs, 1)
+        return states, probs
+    end
+    
     for a_noise in [-pomdp.a_noise, 0., pomdp.a_noise]
         x += 0.5 * a_noise * dt^2
         v = car.v + a_noise * dt
+        if (off_the_road(pomdp, VehicleState(x, v)))
+            continue
+        end
         ind, weight = interpolants(pomdp.grid, [x, v])
         for i in 1:length(ind)
             xg, vg = ind2x(pomdp.grid, ind[i])
@@ -377,7 +404,7 @@ function car_transition(pomdp::AccPOMDP, car::VehicleState,
                 push!(probs, weight[i])
             else
                 state_ind = findall(x -> x == car_state, states)
-                probs[state_ind] += weight[i]
+                probs[state_ind] = probs[state_ind] .+ weight[i]
             end
         end
     end
@@ -391,11 +418,16 @@ end
 ########################################
 # Helper
 ########################################
-function off_road(pomdp::AccPOMDP, car::VehicleState)
-    return car.posG.x > pomdp.road_end.x
+function off_the_road(pomdp::AccPOMDP, car::VehicleState)
+    return car.pos_g.x > pomdp.road_end.x
 end
+
+function get_off_the_road(pomdp::AccPOMDP)
+    return VehicleState(pomdp.road_end, 0.)
+end
+
 function in_bounds(pomdp::AccPOMDP, car::VehicleState)
-    return car.posG.x >= 0. && car.posG.x <= pomdp.road_end.x &&
+    return car.pos_g.x >= 0. && car.pos_g.x <= pomdp.road_end.x &&
         car.v >= 0. && car.v <= pomdp.env.speed_limit
 end
 
@@ -403,24 +435,24 @@ end
 # Observation
 ########################################
 function POMDPs.observation(pomdp::AccPOMDP, sp::AccState)
-    if off_road(pomdp, sp.car)
-        o = AccObs(false, sp.ego, VehicleState(pomdp.road_end.x, sp.car.v))
-        return SparseCat([o], [1.])
-    elseif is_crash(sp.ego, sp.car)
-        return SparseCat([sp], [1.])
+    if off_the_road(pomdp, sp.car)
+        o = AccObs(false, sp.ego, get_off_the_road(pomdp))
+        return AccDistribution([1.], [o])
+    elseif sp.crash
+        return AccDistribution([1.], [sp])
     end
     ego = sp.ego
     car = sp.car
     neighbors = Vector{VehicleState}(undef, 9)
-    neighbors[1] = VehicleState(car.posG.x - pomdp.pos_res, car.v)
-    neighbors[2] = VehicleState(car.posG.x, car.v)
-    neighbors[3] = VehicleState(car.posG.x + pomdp.pos_res, car.v)
-    neighbors[4] = VehicleState(car.posG.x - pomdp.pos_res, car.v - pomdp.vel_res)
-    neighbors[5] = VehicleState(car.posG.x, car.v)
-    neighbors[6] = VehicleState(car.posG.x + pomdp.pos_res, car.v - pomdp.vel_res)
-    neighbors[7] = VehicleState(car.posG.x - pomdp.pos_res, car.v + pomdp.vel_res)
-    neighbors[8] = VehicleState(car.posG.x, car.v)
-    neighbors[9] = VehicleState(car.posG.x + pomdp.pos_res, car.v + pomdp.vel_res)
+    neighbors[1] = VehicleState(car.pos_g.x - pomdp.pos_res, car.v)
+    neighbors[2] = VehicleState(car.pos_g.x, car.v)
+    neighbors[3] = VehicleState(car.pos_g.x + pomdp.pos_res, car.v)
+    neighbors[4] = VehicleState(car.pos_g.x - pomdp.pos_res, car.v - pomdp.vel_res)
+    neighbors[5] = VehicleState(car.pos_g.x, car.v)
+    neighbors[6] = VehicleState(car.pos_g.x + pomdp.pos_res, car.v - pomdp.vel_res)
+    neighbors[7] = VehicleState(car.pos_g.x - pomdp.pos_res, car.v + pomdp.vel_res)
+    neighbors[8] = VehicleState(car.pos_g.x, car.v)
+    neighbors[9] = VehicleState(car.pos_g.x + pomdp.pos_res, car.v + pomdp.vel_res)
     
     obss = AccObs[]
     sizehint!(obss, 9)
@@ -431,7 +463,7 @@ function POMDPs.observation(pomdp::AccPOMDP, sp::AccState)
     end
     probs = ones(length(obss))
     normalize!(probs, 1)
-    return SparseCat(obss, probs)
+    return SparseCat(probs, obss)
 end
 function POMDPs.observation(pomdp::AccPOMDP, ::AccAction, sp::AccState)
     observation(pomdp, sp)
@@ -454,52 +486,67 @@ function POMDPs.convert_s(::Type{A}, s::AccState, pomdp::AccPOMDP) where A <: Ab
     return convert(A, [stateindex(pomdp, s)])
 end
 
+function POMDPs.convert_s(::Type{S}, v::AbstractArray, pomdp::AccPOMDP) where (S <: AccState)
+    id = first(v)
+    x_ego_ind, v_ego_ind, x_car_ind, v_car_ind = CartesianIndices((pomdp.size_x, pomdp.size_v, pomdp.size_x, pomdp.size_v))[id].I
+    x_ego = Float64(floor(x_ego_ind - 1))
+    v_ego = Float64(floor(v_ego_ind - 1))
+    x_car = Float64(floor(x_car_ind - 1))
+    v_car = Float64(floor(v_car_ind - 1))
+    ego = VehicleState(x_ego, v_ego)
+    car = VehicleState(x_car, v_car)
+    return AccState(is_crash(ego, car), ego, car)
+end
+
 ########################################
 # Belief and updater
 ########################################
-const AccBelief = SparseCat
+const AccBelief = AccDistribution
+
 mutable struct AccUpdater <: Updater
     pomdp::AccPOMDP
 end
+
 POMDPs.initialize_belief(::AccUpdater, d::Any) = d
-function POMDPs.update(up::AccUpdater, b::AccBelief,
+
+function POMDPs.update(bu::AccUpdater, bold::AccBelief,
     a::AccAction, o::AccObs)
-    bp = AccBelief()
+    bnew = AccBelief()
     pomdp = b.pomdp
     pomdp_states = ordered_states(pomdp)
-
+    
     for (_, sp) in enumerate(pomdp_states)
         od = observation(pomdp, a, sp)
-        prob_o = pdf(od, o)
-        if prob_o == 0.0
+        probo = pdf(od, o)
+        if probo == 0.0
             continue
         end
         b_sum = 0.0
-        for (j, s) in enumerate(b.vals)
+        for (j, s) in enumerate(bold.it)
             td = transition(pomdp, s, a)
-            prob_sp = pdf(td, sp)
-            @inbounds b_sum += prob_sp * b.probs[j]
+            pp = pdf(td, sp)
+            @inbounds b_sum += pp * bold.p[j]
         end
         if b_sum != 0.
-            push!(bp.vals, sp)
-            push!(bp.probs, prob_o * b_sum)
+            push!(bnew.it, sp)
+            push!(bnew.p, probo * b_sum)
         end
     end
-
-    if sum(bp.probs) == 0.0
-        println("Invalid update for: ", b, " ", a, " ", o)
+    
+    if sum(bnew.p) == 0.0
+        println("Invalid update for: ", bold, " ", a, " ", o)
         throw("UpdateError")
     else
-        normalize!(bp.probs, 1)
+        normalize!(bnew.probs, 1)
     end
-    return bp
+    return bnew
 end
 
 @testset  "Acc POMDP" begin
     rng = MersenneTwister(1)
-
+    
     pomdp = CreateAccPOMDP()
-
+    
     if true
         # Solve
         solver = POMDPSolveSolver()
@@ -524,7 +571,7 @@ end
         # hr = HistoryRecorder(rng=rng, max_steps=100)
         # @time hist = simulate(hr, pomdp, policy, up, nothing, s0);
         # state_history = state_hist(hist)
-        # x = [s.ego.posG.x for s in state_history]
+        # x = [s.ego.pos_g.x for s in state_history]
         # v = [s.ego.v for s in state_history]
         # @show x
         # @show v
@@ -545,11 +592,11 @@ end
         hr = HistoryRecorder(rng=rng, max_steps=100)
         @time hist = simulate(hr, pomdp, policy, up, initial_obs_vec, s0)
         state_history = state_hist(hist)
-        x_car = [s.car.posG.x for s in state_history]
+        x_car = [s.car.pos_g.x for s in state_history]
         v_car = [s.car.v for s in state_history]
-        x_ego = [s.ego.posG.x for s in state_history]
+        x_ego = [s.ego.pos_g.x for s in state_history]
         v_ego = [s.ego.v for s in state_history]
-        dx = [s.car.posG.x - s.ego.posG.x for s in state_history]
+        dx = [s.car.pos_g.x - s.ego.pos_g.x for s in state_history]
         # @show x_car
         # @show v_car
         # @show x_ego
